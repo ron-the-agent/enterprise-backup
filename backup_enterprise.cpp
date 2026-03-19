@@ -228,13 +228,7 @@ struct Config {
     // PROGRESS PARAMETERS
     // ------------------------------------------------------------------------
 
-    size_t progressIntervalMs = 1000;  // Progress update interval (not yet implemented)
-
-    // ------------------------------------------------------------------------
-    // METRICS PARAMETERS
-    // ------------------------------------------------------------------------
-
-    std::string metricsEndpoint;   // Prometheus push gateway URL (not yet implemented)
+    size_t progressIntervalMs = 1000;  // Progress update interval in milliseconds
 
     // ------------------------------------------------------------------------
     // STATIC METHODS
@@ -963,6 +957,34 @@ public:
     std::string name() const override { return "Buffered"; }
 
     bool copy(const FileInfo& info, const Config& config, BackupStats& stats) override {
+        // Retry loop: attempts the copy up to maxRetries times on failure.
+        // Delay between attempts doubles each time (exponential backoff)
+        // to avoid hammering a temporarily unavailable resource.
+        for (size_t attempt = 0; attempt <= config.maxRetries; ++attempt) {
+            if (attempt > 0) {
+                size_t delayMs = config.retryDelayMs * (1u << (attempt - 1)); // 2^(attempt-1)
+                LOG_WARN("Retrying (" + std::to_string(attempt) + "/" +
+                         std::to_string(config.maxRetries) + "): " +
+                         info.source.string() + " after " + std::to_string(delayMs) + "ms");
+                std::this_thread::sleep_for(milliseconds(delayMs));
+            }
+
+            if (attemptCopy(info, config, stats)) return true;
+
+            // Don't retry if shutdown was requested mid-operation
+            if (g_shutdownRequested.load()) return false;
+        }
+
+        LOG_ERROR("All " + std::to_string(config.maxRetries) +
+                  " retries exhausted for: " + info.source.string());
+        stats.errors++;
+        Metrics::instance().recordError();
+        return false;
+    }
+
+private:
+    // Extracted copy attempt so the retry loop above stays readable.
+    bool attemptCopy(const FileInfo& info, const Config& config, BackupStats& stats) {
         try {
             // Check for shutdown request
             if (g_shutdownRequested.load()) {
@@ -1075,12 +1097,13 @@ public:
             return true;
 
         } catch (const std::exception& e) {
-            LOG_ERROR("Failed to copy " + info.source.string() + ": " + e.what());
-            stats.errors++;
-            Metrics::instance().recordError();
+            // Log the failure but don't update error stats yet —
+            // the retry loop will decide if this is a final failure.
+            LOG_WARN("Attempt failed for " + info.source.string() + ": " + e.what());
             return false;
         }
     }
+    // (error stat is incremented by the outer retry loop on final failure)
 };
 
 // ============================================================================
@@ -1276,7 +1299,40 @@ public:
             return stats;
         }
 
-        // Phase 2: Execute based on selected mode
+        // Phase 2: Start background progress reporter thread.
+        // Runs independently of the copy threads — wakes every progressIntervalMs
+        // and prints a one-line summary to stdout. Stops when progressDone is set.
+        std::atomic<bool> progressDone{false};
+        const size_t totalFiles = files.size();
+        auto progressStartTime = steady_clock::now();
+
+        std::thread progressThread([&]() {
+            while (!progressDone.load()) {
+                std::this_thread::sleep_for(milliseconds(config_.progressIntervalMs));
+                if (progressDone.load()) break;
+
+                size_t copied  = stats.filesCopied.load();
+                size_t skipped = stats.filesSkipped.load();
+                size_t errors  = stats.errors.load();
+                size_t done    = copied + skipped + errors;
+                size_t bytes   = stats.totalBytes.load();
+
+                auto elapsed = duration_cast<seconds>(steady_clock::now() - progressStartTime).count();
+                double mbps = elapsed > 0
+                    ? (bytes / 1024.0 / 1024.0) / elapsed
+                    : 0.0;
+
+                std::ostringstream oss;
+                oss << "[Progress] " << done << "/" << totalFiles << " files"
+                    << " | Copied: " << copied
+                    << " | Skipped: " << skipped
+                    << " | Errors: " << errors
+                    << " | " << std::fixed << std::setprecision(1) << mbps << " MB/s";
+                LOG_INFO(oss.str());
+            }
+        });
+
+        // Phase 3: Execute based on selected mode
         switch (config_.mode) {
             case Config::Mode::SYNC:
                 runSync(files, stats);
@@ -1289,6 +1345,10 @@ public:
                 runThreaded(files, stats);
                 break;
         }
+
+        // Stop the progress thread cleanly before returning.
+        progressDone.store(true);
+        progressThread.join();
 
         return stats;
     }
@@ -1655,9 +1715,6 @@ int main(int argc, char* argv[]) {
     auto startTime = steady_clock::now();
 
     // Execute backup
-    std::cout << "DEBUG: Source = " << fs::absolute(sourcePath) << std::endl;
-    std::cout << "DEBUG: Dest = " << fs::absolute(destPath) << std::endl;
-    std::cout << "DEBUG: Recursive = " << (config.recursive ? "true" : "false") << std::endl;
     BackupEngine engine(config);
     BackupStats stats = engine.run(sourcePath, destPath);
 
