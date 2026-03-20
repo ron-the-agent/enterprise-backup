@@ -905,7 +905,77 @@ private:
 };
 
 // ============================================================================
-// COPY STRATEGY INTERFACE (Strategy Pattern)
+// FILE QUEUE - Thread-Safe Producer/Consumer Queue
+// ============================================================================
+/**
+ * FileQueue - Bounded blocking queue connecting the scanner thread to copy workers.
+ *
+ * The scanner thread pushes FileInfo entries as it discovers them.
+ * Copy workers pop entries and process them immediately — no need to
+ * wait for the full directory scan to finish before copying starts.
+ *
+ * Bounded capacity (maxSize) applies backpressure to the scanner:
+ * if workers can't keep up, the scanner sleeps until space opens up,
+ * preventing unbounded memory growth on multi-million-file trees.
+ *
+ * Usage:
+ *   FileQueue q(500);
+ *   // Producer thread:  q.push(fileInfo);   q.markDone();
+ *   // Consumer threads: while (q.pop(info)) { process(info); }
+ */
+class FileQueue {
+public:
+    explicit FileQueue(size_t maxSize) : maxSize_(maxSize), done_(false) {}
+
+    // Push a FileInfo onto the queue.
+    // Blocks if the queue is full (backpressure) until a consumer makes room.
+    void push(FileInfo item) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        // Wait until there is space in the queue or shutdown is requested.
+        notFull_.wait(lock, [this] {
+            return queue_.size() < maxSize_ || g_shutdownRequested.load();
+        });
+        queue_.push(std::move(item));
+        notEmpty_.notify_one();  // Wake a waiting consumer.
+    }
+
+    // Pop the next FileInfo from the queue.
+    // Blocks until an item is available or the queue is fully drained.
+    // Returns false when scanning is complete AND the queue is empty.
+    bool pop(FileInfo& item) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        notEmpty_.wait(lock, [this] {
+            return !queue_.empty() || done_.load();
+        });
+
+        if (queue_.empty()) return false;  // Drained and done.
+
+        item = std::move(queue_.front());
+        queue_.pop();
+        notFull_.notify_one();  // Wake the scanner if it was blocked.
+        return true;
+    }
+
+    // Called by the scanner thread when it has finished pushing all files.
+    // Wakes all waiting consumers so they can drain the queue and exit.
+    void markDone() {
+        done_.store(true);
+        notEmpty_.notify_all();
+    }
+
+    size_t size() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return queue_.size();
+    }
+
+private:
+    std::queue<FileInfo>    queue_;
+    std::mutex              mutex_;
+    std::condition_variable notFull_;   // Signalled when space opens up for the producer.
+    std::condition_variable notEmpty_;  // Signalled when items are available for consumers.
+    size_t                  maxSize_;   // Bounded capacity to limit memory usage.
+    std::atomic<bool>       done_;      // Set when scanning is complete.
+};
 // ============================================================================
 /**
  * CopyStrategy - Abstract base class for copy algorithms
@@ -1290,14 +1360,50 @@ public:
     BackupStats run(const fs::path& source, const fs::path& dest) {
         BackupStats stats;
 
-        // Phase 1: Collect all files to process
-        std::vector<FileInfo> files = collectFiles(source, dest);
-        LOG_INFO("Found " + std::to_string(files.size()) + " files to process");
+        // Phase 1: Create the shared queue and launch the scanner thread.
+        // The queue is bounded by queueSize to limit memory on huge trees.
+        // The scanner pushes files as it walks the directory; copy workers
+        // start consuming immediately — no full scan needed before copying.
+        FileQueue queue(config_.queueSize);
 
-        if (files.empty()) {
-            LOG_INFO("No files to backup");
-            return stats;
-        }
+        std::thread scannerThread([this, &source, &dest, &queue]() {
+            LOG_INFO("Scanner started");
+            scanInBackground(source, dest, queue);
+            LOG_INFO("Scanner finished");
+        });
+
+        // Phase 2: Start background progress reporter.
+        // totalFiles is unknown upfront now, so we report files done so far
+        // and omit the "/total" — it gets printed once scanning completes.
+        std::atomic<bool> progressDone{false};
+        auto progressStartTime = steady_clock::now();
+
+        std::thread progressThread([&]() {
+            while (!progressDone.load()) {
+                std::this_thread::sleep_for(milliseconds(config_.progressIntervalMs));
+                if (progressDone.load()) break;
+
+                size_t copied  = stats.filesCopied.load();
+                size_t skipped = stats.filesSkipped.load();
+                size_t errors  = stats.errors.load();
+                size_t done    = copied + skipped + errors;
+                size_t bytes   = stats.totalBytes.load();
+
+                auto elapsed = duration_cast<seconds>(
+                    steady_clock::now() - progressStartTime).count();
+                double mbps = elapsed > 0
+                    ? (bytes / 1024.0 / 1024.0) / elapsed : 0.0;
+
+                std::ostringstream oss;
+                oss << "[Progress] " << done << " files done"
+                    << " | Copied: "  << copied
+                    << " | Skipped: " << skipped
+                    << " | Errors: "  << errors
+                    << " | " << std::fixed << std::setprecision(1) << mbps << " MB/s"
+                    << " | Queue: "   << queue.size();
+                LOG_INFO(oss.str());
+            }
+        });
 
         // Phase 2: Start background progress reporter thread.
         // Runs independently of the copy threads — wakes every progressIntervalMs
@@ -1335,14 +1441,14 @@ public:
         // Phase 3: Execute based on selected mode
         switch (config_.mode) {
             case Config::Mode::SYNC:
-                runSync(files, stats);
+                runSync(queue, stats);
                 break;
             case Config::Mode::ASYNC:
-                runAsync(files, stats);
+                runAsync(queue, stats);
                 break;
             case Config::Mode::THREADED:
             case Config::Mode::MMAP:
-                runThreaded(files, stats);
+                runThreaded(queue, stats);
                 break;
         }
 
@@ -1359,87 +1465,92 @@ private:
     std::mutex statsMutex_;
 
     /**
-     * collectFiles() - Scan source and build file list
+     * buildFileInfo() - Construct a FileInfo from a directory entry.
      *
-     * Recursively (or shallow) scans the source directory and creates
-     * FileInfo entries for each file found.
+     * Extracted helper to avoid duplicating the same logic in both
+     * the recursive and shallow scan paths.
      */
-    std::vector<FileInfo> collectFiles(const fs::path& source, const fs::path& dest) {
-        std::vector<FileInfo> files;
+    FileInfo buildFileInfo(const fs::path& entryPath, const fs::path& source,
+                           const fs::path& dest) {
+        FileInfo info;
+        info.source       = entryPath;
+        info.size         = fs::file_size(entryPath);
+        info.lastModified = fs::last_write_time(entryPath);
+        info.dest         = dest / fs::relative(entryPath, source);
 
-        // Handle single file case
+        if (fs::exists(info.dest)) {
+            auto destTime = fs::last_write_time(info.dest);
+            auto destSize = fs::file_size(info.dest);
+            info.needsCopy = (info.lastModified > destTime) || (info.size != destSize);
+        } else {
+            info.needsCopy = true;
+        }
+        return info;
+    }
+
+    /**
+     * scanInBackground() - Push files into the queue as they are discovered.
+     *
+     * Runs on a dedicated scanner thread. Copy workers begin processing
+     * immediately — they don't wait for the full tree to be scanned.
+     *
+     * The scanner applies backpressure via the bounded queue: if workers
+     * fall behind, push() blocks until space opens up, keeping memory
+     * usage bounded regardless of how many files exist on disk.
+     *
+     * @param source  Root directory to scan
+     * @param dest    Destination root (used to compute dest paths)
+     * @param queue   Shared queue that copy workers are consuming from
+     */
+    void scanInBackground(const fs::path& source, const fs::path& dest,
+                          FileQueue& queue) {
+        // Handle single file — push it directly and finish.
         if (fs::is_regular_file(source)) {
             FileInfo info;
-            info.source = source;
-            info.dest = dest / source.filename();
-            info.size = fs::file_size(source);
+            info.source       = source;
+            info.dest         = dest / source.filename();
+            info.size         = fs::file_size(source);
             info.lastModified = fs::last_write_time(source);
-            info.needsCopy = true;
-            files.push_back(info);
-            return files;
+            info.needsCopy    = true;
+            queue.push(std::move(info));
+            queue.markDone();
+            return;
         }
 
-        // Choose iterator based on recursive flag.
-        // A ternary can't be used here because recursive_directory_iterator
-        // and directory_iterator are different types — the compiler can't
-        // reconcile them in a single expression.
-        if (config_.recursive) {
-            for (const auto& entry : fs::recursive_directory_iterator(source)) {
-                if (g_shutdownRequested.load()) break;
-                if (!fs::is_regular_file(entry)) continue;
-
-                FileInfo info;
-                info.source = entry.path();
-                info.size = fs::file_size(entry);
-                info.lastModified = fs::last_write_time(entry);
-                fs::path relPath = fs::relative(entry.path(), source);
-                info.dest = dest / relPath;
-
-                if (fs::exists(info.dest)) {
-                    auto destTime = fs::last_write_time(info.dest);
-                    auto destSize = fs::file_size(info.dest);
-                    info.needsCopy = (info.lastModified > destTime) || (info.size != destSize);
-                } else {
-                    info.needsCopy = true;
+        // Scan directory — push each regular file into the queue as found.
+        // Workers on the other end start copying before we finish scanning.
+        try {
+            if (config_.recursive) {
+                for (const auto& entry : fs::recursive_directory_iterator(source)) {
+                    if (g_shutdownRequested.load()) break;
+                    if (!fs::is_regular_file(entry)) continue;
+                    queue.push(buildFileInfo(entry.path(), source, dest));
                 }
-                files.push_back(info);
-            }
-        } else {
-            for (const auto& entry : fs::directory_iterator(source)) {
-                if (g_shutdownRequested.load()) break;
-                if (!fs::is_regular_file(entry)) continue;
-
-                FileInfo info;
-                info.source = entry.path();
-                info.size = fs::file_size(entry);
-                info.lastModified = fs::last_write_time(entry);
-                fs::path relPath = fs::relative(entry.path(), source);
-                info.dest = dest / relPath;
-
-                if (fs::exists(info.dest)) {
-                    auto destTime = fs::last_write_time(info.dest);
-                    auto destSize = fs::file_size(info.dest);
-                    info.needsCopy = (info.lastModified > destTime) || (info.size != destSize);
-                } else {
-                    info.needsCopy = true;
+            } else {
+                for (const auto& entry : fs::directory_iterator(source)) {
+                    if (g_shutdownRequested.load()) break;
+                    if (!fs::is_regular_file(entry)) continue;
+                    queue.push(buildFileInfo(entry.path(), source, dest));
                 }
-                files.push_back(info);
             }
+        } catch (const std::exception& e) {
+            LOG_ERROR("Scanner error: " + std::string(e.what()));
         }
 
-        return files;
+        // Signal consumers that no more files are coming.
+        queue.markDone();
     }
 
     /**
      * runSync() - Single-threaded sequential execution
      *
-     * Simplest mode: processes files one at a time.
-     * Best for: Reliability, debugging, small file sets
+     * Pops files from the queue one at a time and copies them.
+     * Best for: Reliability, debugging, small file sets.
      */
-    void runSync(const std::vector<FileInfo>& files, BackupStats& stats) {
+    void runSync(FileQueue& queue, BackupStats& stats) {
         BufferedCopyStrategy strategy;
-
-        for (const auto& file : files) {
+        FileInfo file;
+        while (queue.pop(file)) {
             if (g_shutdownRequested.load()) break;
             strategy.copy(file, config_, stats);
         }
@@ -1448,19 +1559,19 @@ private:
     /**
      * runAsync() - Async/futures with limited concurrency
      *
-     * Uses std::async to launch tasks, with a limit on concurrent operations.
-     * Best for: Progress tracking, controlled parallelism
+     * Pops files from the shared queue as they arrive from the scanner thread,
+     * launching each as an async task. Limits concurrency to maxConcurrent.
      */
-    void runAsync(const std::vector<FileInfo>& files, BackupStats& stats) {
+    void runAsync(FileQueue& queue, BackupStats& stats) {
         BufferedCopyStrategy strategy;
         std::vector<std::future<bool>> futures;
+        FileInfo file;
 
-        for (const auto& file : files) {
+        while (queue.pop(file)) {
             if (g_shutdownRequested.load()) break;
 
             // Wait if we've hit the concurrency limit
             while (futures.size() >= config_.maxConcurrent) {
-                // Remove completed futures
                 for (auto it = futures.begin(); it != futures.end();) {
                     if (it->wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
                         it = futures.erase(it);
@@ -1468,36 +1579,32 @@ private:
                         ++it;
                     }
                 }
-
-                // If still at limit, wait a bit
                 if (futures.size() >= config_.maxConcurrent) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 }
             }
 
-            // Launch new async task
-            futures.push_back(std::async(std::launch::async, [&]() {
-                return strategy.copy(file, config_, stats);
-            }));
+            // Capture file by value — it comes off the queue and is safe to move.
+            futures.push_back(std::async(std::launch::async,
+                [f = std::move(file), &strategy, &stats, this]() mutable {
+                    return strategy.copy(f, config_, stats);
+                }
+            ));
         }
 
-        // Wait for remaining tasks
-        for (auto& f : futures) {
-            f.wait();
-        }
+        // Wait for remaining in-flight tasks to complete.
+        for (auto& f : futures) f.wait();
     }
 
     /**
      * runThreaded() - Thread pool execution
      *
-     * Uses the thread pool for efficient task distribution.
-     * Best for: Many small files, maximum throughput
+     * Pops files from the shared queue as the scanner discovers them and
+     * enqueues each as a task in the thread pool. Copying and scanning
+     * happen concurrently — workers never wait for a full directory scan.
      */
-    void runThreaded(const std::vector<FileInfo>& files, BackupStats& stats) {
-        // Declare as the base class pointer so both MmapCopyStrategy and
-        // BufferedCopyStrategy (which both derive from CopyStrategy) can be
-        // assigned to it. unique_ptr<MmapCopyStrategy> can't be reassigned
-        // to unique_ptr<BufferedCopyStrategy> — they're unrelated pointer types.
+    void runThreaded(FileQueue& queue, BackupStats& stats) {
+        // Declare as the base class pointer so both strategies are assignable.
         std::unique_ptr<CopyStrategy> strategy;
         if (config_.mode == Config::Mode::THREADED) {
             strategy = std::make_unique<BufferedCopyStrategy>();
@@ -1505,21 +1612,23 @@ private:
             strategy = std::make_unique<MmapCopyStrategy>();
         }
 
-        for (const auto& file : files) {
+        FileInfo file;
+        while (queue.pop(file)) {
             if (g_shutdownRequested.load()) break;
 
-            // Apply backpressure if queue is full
+            // Apply backpressure if the thread pool's internal queue is full.
             while (pool_->pendingTasks() >= config_.queueSize) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
 
-            // Enqueue task
-            pool_->enqueue([&strategy, &file, &stats, this]() {
-                strategy->copy(file, config_, stats);
+            // Capture file by value — each lambda needs its own copy since
+            // 'file' is reused by the pop loop on the next iteration.
+            pool_->enqueue([f = std::move(file), &strategy, &stats, this]() mutable {
+                strategy->copy(f, config_, stats);
             });
         }
 
-        // Wait for all tasks to complete
+        // Block until all enqueued tasks have finished.
         pool_->waitForCompletion();
     }
 };
