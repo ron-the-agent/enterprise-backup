@@ -768,7 +768,7 @@ public:
      *
      * @param numThreads Number of worker threads to create
      */
-    explicit ThreadPool(size_t numThreads) : stop_(false), activeTasks_(0) {
+    explicit ThreadPool(size_t numThreads) : activeTasks_(0), stop_(false) {
         workers_.reserve(numThreads);
         for (size_t i = 0; i < numThreads; ++i) {
             workers_.emplace_back([this] { workerLoop(); });
@@ -1405,19 +1405,35 @@ public:
             }
         });
 
-        // Phase 3: Execute based on selected mode
-        switch (config_.mode) {
-            case Config::Mode::SYNC:
-                runSync(queue, stats);
-                break;
-            case Config::Mode::ASYNC:
-                runAsync(queue, stats);
-                break;
-            case Config::Mode::THREADED:
-            case Config::Mode::MMAP:
-                runThreaded(queue, stats);
-                break;
+        // Phase 3: Execute based on selected mode.
+        // Wrapped in try/catch so both threads are always joined on exceptions —
+        // a joinable std::thread destroyed without join/detach calls std::terminate().
+        try {
+            switch (config_.mode) {
+                case Config::Mode::SYNC:
+                    runSync(queue, stats);
+                    break;
+                case Config::Mode::ASYNC:
+                    runAsync(queue, stats);
+                    break;
+                case Config::Mode::THREADED:
+                case Config::Mode::MMAP:
+                    runThreaded(queue, stats);
+                    break;
+            }
+        } catch (...) {
+            // Unblock the scanner thread if it's waiting to push — without this
+            // it would hang forever and scannerThread.join() would never return.
+            queue.markDone();
+            scannerThread.join();
+            progressDone.store(true);
+            progressThread.join();
+            throw;
         }
+
+        // Scanner must be joined before returning — it was never joined before,
+        // causing std::terminate() when the thread object went out of scope.
+        scannerThread.join();
 
         // Stop the progress thread cleanly before returning.
         progressDone.store(true);
