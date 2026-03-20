@@ -1405,7 +1405,40 @@ public:
             }
         });
 
-        // Phase 3: Execute based on selected mode, consuming from the queue.
+        // Phase 2: Start background progress reporter thread.
+        // Runs independently of the copy threads — wakes every progressIntervalMs
+        // and prints a one-line summary to stdout. Stops when progressDone is set.
+        std::atomic<bool> progressDone{false};
+        const size_t totalFiles = files.size();
+        auto progressStartTime = steady_clock::now();
+
+        std::thread progressThread([&]() {
+            while (!progressDone.load()) {
+                std::this_thread::sleep_for(milliseconds(config_.progressIntervalMs));
+                if (progressDone.load()) break;
+
+                size_t copied  = stats.filesCopied.load();
+                size_t skipped = stats.filesSkipped.load();
+                size_t errors  = stats.errors.load();
+                size_t done    = copied + skipped + errors;
+                size_t bytes   = stats.totalBytes.load();
+
+                auto elapsed = duration_cast<seconds>(steady_clock::now() - progressStartTime).count();
+                double mbps = elapsed > 0
+                    ? (bytes / 1024.0 / 1024.0) / elapsed
+                    : 0.0;
+
+                std::ostringstream oss;
+                oss << "[Progress] " << done << "/" << totalFiles << " files"
+                    << " | Copied: " << copied
+                    << " | Skipped: " << skipped
+                    << " | Errors: " << errors
+                    << " | " << std::fixed << std::setprecision(1) << mbps << " MB/s";
+                LOG_INFO(oss.str());
+            }
+        });
+
+        // Phase 3: Execute based on selected mode
         switch (config_.mode) {
             case Config::Mode::SYNC:
                 runSync(queue, stats);
@@ -1419,16 +1452,9 @@ public:
                 break;
         }
 
-        // Wait for scanner to finish (it should already be done by now).
-        scannerThread.join();
-
-        // Stop progress reporter.
+        // Stop the progress thread cleanly before returning.
         progressDone.store(true);
         progressThread.join();
-
-        LOG_INFO("Backup complete. Copied: " + std::to_string(stats.filesCopied) +
-                 ", Skipped: " + std::to_string(stats.filesSkipped) +
-                 ", Errors: "  + std::to_string(stats.errors));
 
         return stats;
     }
