@@ -73,6 +73,7 @@
 // Unix/Linux uses POSIX mmap API
 #ifdef _WIN32
     #include <windows.h>      // Windows API: CreateFile, MapViewOfFile, etc.
+    #include <io.h>          // Windows: _write for low-level I/O in signal handler
     #undef ERROR              // Undefine Windows macro to avoid conflict with enum
 #else
     #include <sys/mman.h>     // POSIX: mmap, munmap for memory-mapped I/O
@@ -362,9 +363,12 @@ struct Config {
     // LOGGING PARAMETERS
     // ------------------------------------------------------------------------
 
-    std::string logFile;           // Path to log file (empty = no file logging)
-    std::string logLevel = "INFO"; // Minimum level to log: DEBUG, INFO, WARN, ERROR
-    bool logToConsole = true;      // Also log to stdout
+    std::string logFile;                        // Path to general log file (empty = no file logging)
+    std::string copyLogFile = "backup_copy.log"; // Path to per-file copy audit log (CSV)
+                                                //   Each successfully copied file gets one row.
+                                                //   Set to "" to disable.
+    std::string logLevel = "INFO";              // Minimum level to log: DEBUG, INFO, WARN, ERROR
+    bool logToConsole = true;                   // Also log to stdout/stderr
 
     // ------------------------------------------------------------------------
     // PROGRESS PARAMETERS
@@ -383,22 +387,51 @@ struct Config {
 };
 
 // ============================================================================
+// ANSI TERMINAL COLOR CODES
+// ============================================================================
+// Used to colorize console output by log level for quick visual scanning.
+// Automatically disabled if stdout/stderr is not a TTY (e.g. piped output).
+namespace AnsiColor {
+    // Foreground colors
+    static const char* RESET   = "\033[0m";
+    static const char* BOLD    = "\033[1m";
+    static const char* CYAN    = "\033[36m";
+    static const char* GREEN   = "\033[32m";
+    static const char* YELLOW  = "\033[33m";
+    static const char* RED     = "\033[31m";
+    static const char* MAGENTA = "\033[35m";
+    static const char* WHITE   = "\033[97m";
+    static const char* DIM     = "\033[2m";
+
+    // Check once at startup whether the terminal supports ANSI escapes.
+    // If stdout is a pipe or redirected file, suppress colors automatically.
+    inline bool supported() {
+#ifdef _WIN32
+        return false;   // Windows console needs SetConsoleMode; skip for portability
+#else
+        static bool ok = isatty(STDOUT_FILENO);
+        return ok;
+#endif
+    }
+}
+
+// ============================================================================
 // LOGGER CLASS - Thread-Safe Structured Logging
 // ============================================================================
 /**
  * Logger - Singleton pattern for centralized logging
  *
- * This class provides thread-safe logging with multiple severity levels.
- * It supports both console and file output simultaneously.
+ * Improvements over v1:
+ *   - ANSI color-coded console output per log level (auto-disabled when piped)
+ *   - ERROR and FATAL messages routed to stderr; everything else to stdout
+ *   - Separate "copy audit log" written to copyLogFile (CSV-style, one line
+ *     per successfully copied file with full metadata)
+ *   - Per-level label padding so columns stay aligned in the terminal
  *
  * Design Patterns:
  * - Singleton: Only one logger instance exists globally
  * - RAII: Log file is automatically closed on destruction
  * - Thread-Safe: Internal mutex protects shared resources
- *
- * Usage:
- *   Logger::instance().info("Backup started");
- *   LOG_ERROR("Failed to copy file: " + path);
  */
 class Logger {
 public:
@@ -413,28 +446,47 @@ public:
 
     /**
      * instance() - Get the singleton logger instance
-     *
-     * Thread-safe due to C++11 static initialization guarantees.
-     * The instance is created on first call and destroyed at program exit.
      */
     static Logger& instance() {
-        static Logger instance;  // C++11 guarantees thread-safe initialization
+        static Logger instance;
         return instance;
     }
 
     /**
      * init() - Initialize the logger with configuration
      *
+     * Opens the general log file and the copy-audit log file.
      * Must be called before any logging operations.
-     * Opens the log file if specified.
      */
     void init(const Config& config) {
         config_ = config;
+
+        // General application log
         if (!config.logFile.empty()) {
-            // Open in append mode to preserve existing logs
             fileStream_.open(config.logFile, std::ios::app);
             if (!fileStream_.is_open()) {
-                std::cerr << "Warning: Could not open log file: " << config.logFile << std::endl;
+                std::cerr << AnsiColor::YELLOW
+                          << "Warning: Could not open log file: " << config.logFile
+                          << AnsiColor::RESET << std::endl;
+            }
+        }
+
+        // Copy-audit log: tracks every file that was successfully copied.
+        // Always opened regardless of --log; use --copy-log "" to disable.
+        if (!config.copyLogFile.empty()) {
+            copyLogStream_.open(config.copyLogFile, std::ios::app);
+            if (!copyLogStream_.is_open()) {
+                std::cerr << AnsiColor::YELLOW
+                          << "Warning: Could not open copy log file: " << config.copyLogFile
+                          << AnsiColor::RESET << std::endl;
+            } else {
+                // Write CSV header if the file is new (position == 0 after open)
+                if (copyLogStream_.tellp() == 0) {
+                    copyLogStream_
+                        << "timestamp,status,strategy,source_path,dest_path,"
+                           "size_bytes,duration_ms,checksum_hex\n";
+                    copyLogStream_.flush();
+                }
             }
         }
     }
@@ -445,78 +497,158 @@ public:
      * Formats the message with timestamp and level, then outputs to
      * configured destinations (console and/or file).
      *
-     * Thread-safe: Protected by mutex_ for concurrent access
+     * Console output:
+     *   - Color-coded by level for fast visual scanning
+     *   - ERROR / FATAL routed to stderr
+     *   - DEBUG / INFO / WARN routed to stdout
+     *
+     * File output: plain text (no ANSI codes), same format as before.
+     *
+     * Thread-safe: Protected by mutex_ for concurrent access.
      */
     void log(Level level, const std::string& message) {
-        // Early exit if this level is below the configured minimum
         if (!shouldLog(level)) return;
 
-        // Get current time for timestamp
-        auto now = system_clock::now();
+        auto now  = system_clock::now();
         auto time = system_clock::to_time_t(now);
 
-        // Format: "YYYY-MM-DD HH:MM:SS [LEVEL] message"
-        std::stringstream ss;
-        ss << std::put_time(std::localtime(&time), "%Y-%m-%d %H:%M:%S");
-        ss << " [" << levelToString(level) << "] " << message;
+        // Plain text line for file (no color escapes)
+        std::stringstream plain;
+        plain << std::put_time(std::localtime(&time), "%Y-%m-%d %H:%M:%S")
+              << " [" << levelToString(level) << "] " << message;
 
-        // Lock to ensure atomic output (prevents interleaved messages)
         std::lock_guard<std::mutex> lock(mutex_);
 
         if (config_.logToConsole) {
-            // Output to stdout (not cerr, to keep errors separate)
-            std::cout << ss.str() << std::endl;
+            // Pick color and stream based on level
+            const char* color = colorForLevel(level);
+            const char* col   = AnsiColor::supported() ? color            : "";
+
+            bool isError = (level == Level::ERROR || level == Level::FATAL);
+            std::ostream& out = isError ? std::cerr : std::cout;
+
+            // Timestamp in dim, level label in color, message in default
+            if (AnsiColor::supported()) {
+                out << AnsiColor::DIM
+                    << std::put_time(std::localtime(&time), "%Y-%m-%d %H:%M:%S")
+                    << AnsiColor::RESET
+                    << " " << col << AnsiColor::BOLD
+                    << "[" << std::left << std::setw(5) << levelToString(level) << "]"
+                    << AnsiColor::RESET
+                    << " " << message << "\n";
+            } else {
+                out << plain.str() << "\n";
+            }
         }
 
         if (fileStream_.is_open()) {
-            fileStream_ << ss.str() << std::endl;
-            // Optional: flush for immediate persistence
-            // fileStream_.flush();
+            fileStream_ << plain.str() << "\n";
         }
     }
 
+    /**
+     * logCopiedFile() - Append one line to the copy-audit log.
+     *
+     * Called by each copy strategy after a successful file transfer.
+     * Fields (CSV):
+     *   timestamp, status, strategy, source_path, dest_path,
+     *   size_bytes, duration_ms, checksum_hex
+     *
+     * @param strategy   "Buffered" or "MemoryMapped"
+     * @param src        Absolute source path
+     * @param dst        Absolute destination path
+     * @param sizeBytes  File size in bytes
+     * @param durationMs Copy duration in milliseconds
+     * @param checksum   xxHash-64 result (0 = not verified)
+     */
+    void logCopiedFile(const std::string& strategy,
+                       const std::string& src,
+                       const std::string& dst,
+                       size_t             sizeBytes,
+                       long long          durationMs,
+                       uint64_t           checksum = 0)
+    {
+        std::lock_guard<std::mutex> lock(copyMutex_);
+        if (!copyLogStream_.is_open()) return;
+
+        auto now  = system_clock::now();
+        auto time = system_clock::to_time_t(now);
+
+        // Escape any commas inside paths by wrapping in quotes
+        auto csvQuote = [](const std::string& s) -> std::string {
+            return "\"" + s + "\"";
+        };
+
+        std::ostringstream row;
+        row << std::put_time(std::localtime(&time), "%Y-%m-%d %H:%M:%S")
+            << ",COPIED"
+            << "," << strategy
+            << "," << csvQuote(src)
+            << "," << csvQuote(dst)
+            << "," << sizeBytes
+            << "," << durationMs;
+
+        if (checksum != 0) {
+            row << ",0x" << std::hex << std::uppercase << checksum;
+        } else {
+            row << ",N/A";
+        }
+
+        copyLogStream_ << row.str() << "\n";
+        copyLogStream_.flush();   // Ensure visibility even if the process is killed
+    }
+
     // Convenience methods for each log level
-    void debug(const std::string& msg) { log(Level::DEBUG, msg); }
-    void info(const std::string& msg) { log(Level::INFO, msg); }
+    void debug(const std::string& msg)   { log(Level::DEBUG,   msg); }
+    void info(const std::string& msg)    { log(Level::INFO,    msg); }
     void warning(const std::string& msg) { log(Level::WARNING, msg); }
-    void error(const std::string& msg) { log(Level::ERROR, msg); }
-    void fatal(const std::string& msg) { log(Level::FATAL, msg); }
+    void error(const std::string& msg)   { log(Level::ERROR,   msg); }
+    void fatal(const std::string& msg)   { log(Level::FATAL,   msg); }
 
 private:
-    // Private constructor for singleton pattern
     Logger() = default;
-
-    // Delete copy/move constructors to enforce singleton
     Logger(const Logger&) = delete;
     Logger& operator=(const Logger&) = delete;
 
-    Config config_;                    // Copy of configuration
-    std::ofstream fileStream_;         // Log file output stream
-    std::mutex mutex_;                 // Protects fileStream_ and console output
+    Config        config_;
+    std::ofstream fileStream_;     // General application log
+    std::ofstream copyLogStream_;  // Copy-audit CSV log
+    std::mutex    mutex_;          // Guards fileStream_ + console output
+    std::mutex    copyMutex_;      // Guards copyLogStream_ separately
 
     /**
-     * shouldLog() - Check if a message at the given level should be logged
-     *
-     * Compares the message level against the configured minimum level.
+     * colorForLevel() - Map a log level to its ANSI foreground color.
      */
-    bool shouldLog(Level level) {
-        // Map string level names to enum values
-        static std::map<std::string, Level> levels = {
-            {"DEBUG", Level::DEBUG},
-            {"INFO", Level::INFO},
-            {"WARNING", Level::WARNING},
-            {"WARN", Level::WARNING},
-            {"ERROR", Level::ERROR},
-            {"FATAL", Level::FATAL}
-        };
-
-        auto it = levels.find(config_.logLevel);
-        Level minLevel = (it != levels.end()) ? it->second : Level::INFO;
-        return level >= minLevel;  // Log if message level >= minimum level
+    static const char* colorForLevel(Level level) {
+        switch (level) {
+            case Level::DEBUG:   return AnsiColor::CYAN;
+            case Level::INFO:    return AnsiColor::GREEN;
+            case Level::WARNING: return AnsiColor::YELLOW;
+            case Level::ERROR:   return AnsiColor::RED;
+            case Level::FATAL:   return AnsiColor::MAGENTA;
+            default:             return AnsiColor::WHITE;
+        }
     }
 
     /**
-     * levelToString() - Convert level enum to string representation
+     * shouldLog() - Check if a message at the given level should be logged
+     */
+    bool shouldLog(Level level) {
+        static std::map<std::string, Level> levels = {
+            {"DEBUG", Level::DEBUG},
+            {"INFO",  Level::INFO},
+            {"WARNING", Level::WARNING},
+            {"WARN",  Level::WARNING},
+            {"ERROR", Level::ERROR},
+            {"FATAL", Level::FATAL}
+        };
+        auto it = levels.find(config_.logLevel);
+        Level minLevel = (it != levels.end()) ? it->second : Level::INFO;
+        return level >= minLevel;
+    }
+
+    /**
+     * levelToString() - Convert level enum to fixed-width string label
      */
     std::string levelToString(Level level) {
         switch (level) {
@@ -525,7 +657,7 @@ private:
             case Level::WARNING: return "WARN";
             case Level::ERROR:   return "ERROR";
             case Level::FATAL:   return "FATAL";
-            default:             return "UNKNOWN";
+            default:             return "?????";
         }
     }
 };
@@ -1328,6 +1460,25 @@ private:
 
             Metrics::instance().recordCopy(info.size, duration);
 
+            // ---- Copy-audit log ----
+            // Record the completed copy with full metadata so operators can
+            // audit exactly which files were transferred in this run.
+            uint64_t recordedHash = 0;
+            if (config.verifyChecksums) {
+                // Re-use the already-computed hash stored from the verify block above.
+                // We re-compute here cheaply; hash64 of a warm file is near-instant.
+                auto h = xxhash::hash64(info.dest);
+                if (h) recordedHash = *h;
+            }
+            Logger::instance().logCopiedFile(
+                "Buffered",
+                info.source.string(),
+                info.dest.string(),
+                info.size,
+                duration.count(),
+                recordedHash
+            );
+
             if (config.verbose) {
                 LOG_INFO("Copied: " + info.source.filename().string());
             }
@@ -1493,6 +1644,21 @@ public:
 
             Metrics::instance().recordCopy(info.size, duration);
 
+            // ---- Copy-audit log ----
+            uint64_t recordedHash = 0;
+            if (config.verifyChecksums) {
+                auto h = xxhash::hash64(info.dest);
+                if (h) recordedHash = *h;
+            }
+            Logger::instance().logCopiedFile(
+                "MemoryMapped",
+                info.source.string(),
+                info.dest.string(),
+                info.size,
+                duration.count(),
+                recordedHash
+            );
+
             if (config.verbose) {
                 LOG_INFO("Copied (mmap): " + info.source.filename().string());
             }
@@ -1571,6 +1737,7 @@ public:
         auto progressStartTime = steady_clock::now();
 
         std::thread progressThread([&]() {
+            const int BAR_WIDTH = 30;
             while (!progressDone.load()) {
                 std::this_thread::sleep_for(milliseconds(config_.progressIntervalMs));
                 if (progressDone.load()) break;
@@ -1586,15 +1753,58 @@ public:
                 double mbps = elapsed > 0
                     ? (bytes / 1024.0 / 1024.0) / elapsed : 0.0;
 
+                // Build a simple animated spinner + bar
+                static const char* spinner = "|/-\\";
+                static int spinIdx = 0;
+                char spin = spinner[spinIdx++ % 4];
+
+                // Format bytes transferred
+                auto fmtBytes = [](size_t b) -> std::string {
+                    const char* u[] = {"B","KB","MB","GB"};
+                    double v = static_cast<double>(b);
+                    int i = 0;
+                    while (v >= 1024.0 && i < 3) { v /= 1024.0; ++i; }
+                    std::ostringstream o;
+                    o << std::fixed << std::setprecision(1) << v << " " << u[i];
+                    return o.str();
+                };
+
+                // Build bar from currently known ratios
+                // Filled = copied, partial = skipped, empty = queued/unknown
+                std::string bar(BAR_WIDTH, ' ');
+                // Since total is unknown, use a bouncing segment instead
+                int pos = static_cast<int>(done % (BAR_WIDTH * 2));
+                if (pos >= BAR_WIDTH) pos = BAR_WIDTH * 2 - pos;
+                if (pos < BAR_WIDTH) bar[pos] = '=';
+                if (pos > 0) bar[pos - 1] = '-';
+
                 std::ostringstream oss;
-                oss << "[Progress] " << done << " files done"
-                    << " | Copied: "  << copied
-                    << " | Skipped: " << skipped
-                    << " | Errors: "  << errors
-                    << " | " << std::fixed << std::setprecision(1) << mbps << " MB/s"
-                    << " | Queue: "   << queue.size();
-                LOG_INFO(oss.str());
+                if (AnsiColor::supported()) {
+                    oss << "\r"
+                        << AnsiColor::CYAN << spin << AnsiColor::RESET
+                        << " [" << AnsiColor::GREEN << bar << AnsiColor::RESET << "]"
+                        << "  Done: " << AnsiColor::BOLD << done << AnsiColor::RESET
+                        << "  " << AnsiColor::GREEN  << "✔ " << copied  << AnsiColor::RESET
+                        << "  " << AnsiColor::DIM    << "⊘ " << skipped << AnsiColor::RESET
+                        << "  " << AnsiColor::RED    << "✘ " << errors  << AnsiColor::RESET
+                        << "  " << AnsiColor::YELLOW << std::fixed << std::setprecision(1)
+                                                     << mbps << " MB/s" << AnsiColor::RESET
+                        << "  " << fmtBytes(bytes)
+                        << "  Queue:" << queue.size()
+                        << "   ";  // trailing spaces erase any leftover chars
+                } else {
+                    oss << "\r[Progress] done=" << done
+                        << " copied=" << copied
+                        << " skipped=" << skipped
+                        << " errors=" << errors
+                        << " " << std::fixed << std::setprecision(1) << mbps << " MB/s"
+                        << " " << fmtBytes(bytes)
+                        << " queue=" << queue.size() << "   ";
+                }
+                std::cout << oss.str() << std::flush;
             }
+            // Erase the progress line before the summary is printed
+            std::cout << "\r" << std::string(120, ' ') << "\r" << std::flush;
         });
 
         // Phase 3: Execute based on selected mode.
@@ -1859,6 +2069,9 @@ Config Config::fromArgs(int argc, char* argv[]) {
         else if (arg == "--log" && i + 1 < argc) {
             config.logFile = argv[++i];
         }
+        else if (arg == "--copy-log" && i + 1 < argc) {
+            config.copyLogFile = argv[++i];
+        }
         else if (arg == "--log-level" && i + 1 < argc) {
             config.logLevel = argv[++i];
         }
@@ -1895,10 +2108,15 @@ void Config::validate() {
  * Worker threads periodically check this flag and exit gracefully.
  */
 void signalHandler(int sig) {
-    if (sig == SIGINT || sig == SIGTERM) {
-        std::cerr << "\nShutdown requested, finishing current operations...\n";
-        g_shutdownRequested.store(true);
-    }
+    g_shutdownRequested.store(true);
+
+    const char* msg = "\n[INFO] Shutdown requested. Finishing in-progress files...\n";
+
+#ifdef _WIN32
+    _write(2, msg, (unsigned)strlen(msg));  // stderr
+#else
+    write(STDERR_FILENO, msg, strlen(msg));
+#endif
 }
 
 // ============================================================================
@@ -1920,6 +2138,9 @@ void printUsage(const char* programName) {
     std::cout << "  -v, --verbose        Detailed output\n";
     std::cout << "  -s, --shallow        Non-recursive copy\n";
     std::cout << "  --log FILE           Log to file\n";
+    std::cout << "  --copy-log FILE      Per-file copy audit log (CSV, default: backup_copy.log)\n";
+    std::cout << "                       Set to \"\" to disable. Each row: timestamp, status,\n";
+    std::cout << "                       strategy, src, dst, size_bytes, duration_ms, checksum\n";
     std::cout << "  --log-level LEVEL    Log level: DEBUG, INFO, WARN, ERROR (default: INFO)\n";
     std::cout << "  --buffer-size KB     Buffer size in KB (default: 1024)\n";
     std::cout << "  --mmap-threshold MB  Use mmap for files > MB (default: 10)\n";
@@ -2006,15 +2227,36 @@ int main(int argc, char* argv[]) {
     auto duration = duration_cast<seconds>(steady_clock::now() - startTime);
 
     // Print summary
-    std::cout << "\n" << std::string(60, '=') << std::endl;
-    std::cout << "BACKUP SUMMARY" << std::endl;
-    std::cout << std::string(60, '=') << std::endl;
-    std::cout << "Files copied:    " << stats.filesCopied << std::endl;
-    std::cout << "Files skipped:   " << stats.filesSkipped << std::endl;
-    std::cout << "Errors:          " << stats.errors << std::endl;
-    std::cout << "Total size:      " << stats.totalBytes << " bytes" << std::endl;
-    std::cout << "Time elapsed:    " << duration.count() << " seconds" << std::endl;
-    std::cout << std::string(60, '=') << std::endl;
+    bool useColor = AnsiColor::supported();
+    auto C  = [&](const char* c) { return useColor ? c : ""; };
+    auto R  = [&]()              { return useColor ? AnsiColor::RESET : ""; };
+
+    std::cout << "\n"
+              << C(AnsiColor::BOLD) << C(AnsiColor::WHITE)
+              << std::string(60, '=') << R() << "\n"
+              << C(AnsiColor::BOLD) << "  BACKUP SUMMARY" << R() << "\n"
+              << C(AnsiColor::BOLD) << C(AnsiColor::WHITE)
+              << std::string(60, '=') << R() << "\n";
+
+    std::cout << "  Files copied:  "
+              << C(AnsiColor::GREEN) << C(AnsiColor::BOLD)
+              << stats.filesCopied  << R() << "\n"
+              << "  Files skipped: "
+              << C(AnsiColor::DIM)  << stats.filesSkipped << R() << "\n"
+              << "  Errors:        "
+              << (stats.errors > 0 ? C(AnsiColor::RED) : C(AnsiColor::GREEN))
+              << stats.errors << R() << "\n"
+              << "  Total size:    "
+              << C(AnsiColor::CYAN) << stats.totalBytes << " bytes" << R() << "\n"
+              << "  Time elapsed:  "
+              << C(AnsiColor::CYAN) << duration.count() << " seconds" << R() << "\n";
+
+    if (!config.copyLogFile.empty()) {
+        std::cout << "  Copy log:      "
+                  << C(AnsiColor::YELLOW) << config.copyLogFile << R() << "\n";
+    }
+    std::cout << C(AnsiColor::BOLD) << C(AnsiColor::WHITE)
+              << std::string(60, '=') << R() << "\n";
 
     // Print detailed metrics
     Metrics::instance().printSummary();
