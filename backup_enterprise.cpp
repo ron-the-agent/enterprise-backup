@@ -89,6 +89,148 @@ namespace fs = std::filesystem;           // fs::path, fs::exists, etc.
 using namespace std::chrono;              // seconds, milliseconds, steady_clock
 
 // ============================================================================
+// XXHASH-64 — Self-contained checksum implementation
+// ============================================================================
+// Public-domain xxHash algorithm by Yann Collet.
+// No external dependency — the algorithm is embedded directly so the binary
+// remains self-contained.  Used for post-copy file integrity verification
+// when --verify is passed on the command line.
+namespace xxhash {
+
+static constexpr uint64_t PRIME1 = 0x9E3779B185EBCA87ULL;
+static constexpr uint64_t PRIME2 = 0xC2B2AE3D27D4EB4FULL;
+static constexpr uint64_t PRIME3 = 0x165667B19E3779F9ULL;
+static constexpr uint64_t PRIME4 = 0x85EBCA77C2B2AE63ULL;
+static constexpr uint64_t PRIME5 = 0x27D4EB2F165667C5ULL;
+
+static inline uint64_t rotl64(uint64_t x, int r) {
+    return (x << r) | (x >> (64 - r));
+}
+
+// Mix one 8-byte lane into an accumulator
+static inline uint64_t xxround(uint64_t acc, uint64_t input) {
+    acc += input * PRIME2;
+    acc  = rotl64(acc, 31);
+    acc *= PRIME1;
+    return acc;
+}
+
+// Fold a finalised accumulator into the running hash
+static inline uint64_t mergeAcc(uint64_t h, uint64_t acc) {
+    h ^= xxround(0, acc);
+    h  = h * PRIME1 + PRIME4;
+    return h;
+}
+
+// Portable unaligned reads (avoids UB on strict-alignment platforms)
+static inline uint64_t readU64(const uint8_t* p) {
+    uint64_t v; std::memcpy(&v, p, 8); return v;
+}
+static inline uint32_t readU32(const uint8_t* p) {
+    uint32_t v; std::memcpy(&v, p, 4); return v;
+}
+
+/**
+ * hash64() - Compute xxHash-64 of a file on disk.
+ *
+ * Reads the file in 64 KB blocks and feeds data through the standard
+ * xxHash-64 streaming algorithm.  The carry buffer handles stripe
+ * boundaries that don't align with read boundaries.
+ *
+ * Returns std::nullopt on any I/O failure so the caller can treat
+ * a missing hash as a mismatch rather than a false positive match.
+ */
+std::optional<uint64_t> hash64(const fs::path& path) {
+    std::ifstream f(path.string(), std::ios::binary);
+    if (!f) return std::nullopt;
+
+    constexpr uint64_t SEED = 0;
+    constexpr size_t   BLOCK = 65536;  // 64 KB read granularity
+
+    uint64_t acc1 = SEED + PRIME1 + PRIME2;
+    uint64_t acc2 = SEED + PRIME2;
+    uint64_t acc3 = SEED;
+    uint64_t acc4 = SEED - PRIME1;
+
+    uint64_t totalLen  = 0;
+    bool     hasStripe = false;  // True once at least one 32-byte stripe processed
+
+    // carry holds bytes that arrived in the last read but haven't yet filled
+    // a complete 32-byte stripe; at most 31 bytes between reads.
+    std::vector<uint8_t> carry;
+    carry.reserve(BLOCK + 32);
+
+    std::vector<char> readBuf(BLOCK);
+
+    while (f.read(readBuf.data(), static_cast<std::streamsize>(BLOCK)) || f.gcount() > 0) {
+        size_t n = static_cast<size_t>(f.gcount());
+        totalLen += n;
+
+        const uint8_t* src = reinterpret_cast<const uint8_t*>(readBuf.data());
+        carry.insert(carry.end(), src, src + n);
+
+        // Consume all complete 32-byte stripes from the carry buffer
+        size_t i = 0;
+        while (i + 32 <= carry.size()) {
+            const uint8_t* s = carry.data() + i;
+            acc1 = xxround(acc1, readU64(s +  0));
+            acc2 = xxround(acc2, readU64(s +  8));
+            acc3 = xxround(acc3, readU64(s + 16));
+            acc4 = xxround(acc4, readU64(s + 24));
+            i += 32;
+            hasStripe = true;
+        }
+        if (i > 0) carry.erase(carry.begin(), carry.begin() + static_cast<std::ptrdiff_t>(i));
+    }
+
+    if (f.bad()) return std::nullopt;
+
+    // --- Finalise ---
+    uint64_t h64;
+    if (hasStripe) {
+        // Merge four accumulators
+        h64 = rotl64(acc1,  1) + rotl64(acc2,  7) +
+              rotl64(acc3, 12) + rotl64(acc4, 18);
+        h64 = mergeAcc(h64, acc1);
+        h64 = mergeAcc(h64, acc2);
+        h64 = mergeAcc(h64, acc3);
+        h64 = mergeAcc(h64, acc4);
+    } else {
+        // File was smaller than 32 bytes — use the short-input seed
+        h64 = SEED + PRIME5;
+    }
+    h64 += totalLen;
+
+    // Process remaining bytes in carry (0–31 bytes)
+    const uint8_t* p   = carry.data();
+    size_t         rem = carry.size();
+
+    while (rem >= 8) {
+        h64 ^= xxround(0, readU64(p));
+        h64  = rotl64(h64, 27) * PRIME1 + PRIME4;
+        p += 8; rem -= 8;
+    }
+    if (rem >= 4) {
+        h64 ^= static_cast<uint64_t>(readU32(p)) * PRIME1;
+        h64  = rotl64(h64, 23) * PRIME2 + PRIME3;
+        p += 4; rem -= 4;
+    }
+    while (rem > 0) {
+        h64 ^= static_cast<uint64_t>(*p) * PRIME5;
+        h64  = rotl64(h64, 11) * PRIME1;
+        ++p; --rem;
+    }
+
+    // Avalanche / final mix
+    h64 ^= h64 >> 33; h64 *= PRIME2;
+    h64 ^= h64 >> 29; h64 *= PRIME3;
+    h64 ^= h64 >> 32;
+    return h64;
+}
+
+} // namespace xxhash
+
+// ============================================================================
 // FORWARD DECLARATIONS
 // ============================================================================
 // Declare classes that are defined later in the file
@@ -1151,6 +1293,32 @@ private:
             // Preserve source file's modification time
             fs::last_write_time(info.dest, info.lastModified);
 
+            // Optional post-copy checksum verification.
+            // Both source and destination are hashed; a mismatch means the data
+            // that landed on disk does not match what was read from the source,
+            // which indicates hardware error, filesystem corruption, or a partial
+            // write that slipped past the OS.  The corrupted destination is
+            // removed so a subsequent run retries the copy cleanly.
+            if (config.verifyChecksums) {
+                auto srcHash = xxhash::hash64(info.source);
+                auto dstHash = xxhash::hash64(info.dest);
+                if (!srcHash || !dstHash || *srcHash != *dstHash) {
+                    LOG_ERROR("Checksum mismatch for: " + info.source.string() +
+                              " — removing corrupted destination");
+                    std::error_code ec;
+                    fs::remove(info.dest, ec);
+                    stats.errors++;
+                    Metrics::instance().recordError();
+                    return false;
+                }
+                if (config.verbose) {
+                    std::ostringstream oss;
+                    oss << "Checksum OK [0x" << std::hex << *srcHash << "]: "
+                        << info.source.filename().string();
+                    LOG_DEBUG(oss.str());
+                }
+            }
+
             // Update statistics
             auto duration = duration_cast<milliseconds>(steady_clock::now() - startTime);
             stats.filesCopied++;
@@ -1291,6 +1459,30 @@ public:
 
             // Preserve modification time
             fs::last_write_time(info.dest, info.lastModified);
+
+            // Optional post-copy checksum verification (same logic as buffered strategy).
+            // For mmap copies the source data was read via a memory mapping rather than
+            // a stream, so hashing re-reads both files from the page cache — fast when
+            // the file is still warm, and a true end-to-end integrity check regardless.
+            if (config.verifyChecksums) {
+                auto srcHash = xxhash::hash64(info.source);
+                auto dstHash = xxhash::hash64(info.dest);
+                if (!srcHash || !dstHash || *srcHash != *dstHash) {
+                    LOG_ERROR("Checksum mismatch (mmap) for: " + info.source.string() +
+                              " — removing corrupted destination");
+                    std::error_code ec;
+                    fs::remove(info.dest, ec);
+                    stats.errors++;
+                    Metrics::instance().recordError();
+                    return false;
+                }
+                if (config.verbose) {
+                    std::ostringstream oss;
+                    oss << "Checksum OK [0x" << std::hex << *srcHash << "]: "
+                        << info.source.filename().string();
+                    LOG_DEBUG(oss.str());
+                }
+            }
 
             // Update statistics
             auto duration = duration_cast<milliseconds>(steady_clock::now() - startTime);
