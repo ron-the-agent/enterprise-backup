@@ -844,27 +844,46 @@ public:
      * close() - Unmap and close the file
      *
      * Safe to call multiple times (idempotent).
+     *
+     * The unmap and handle/fd release are intentionally separate blocks:
+     * - Unmapping requires an active mapping (data_ != nullptr && size_ > 0).
+     * - The underlying handle/fd must be released regardless of whether a
+     *   mapping exists, so zero-byte files (size_ == 0, data_ == nullptr)
+     *   don't leak their descriptor.
      */
     void close() {
+        // Step 1: release the memory mapping (only exists for non-empty files).
         if (data_ && size_ > 0) {
 #ifdef _WIN32
             UnmapViewOfFile(data_);
-            if (hMapping_) CloseHandle(hMapping_);
-            if (hFile_ != INVALID_HANDLE_VALUE) CloseHandle(hFile_);
 #else
             munmap(data_, size_);
-            if (fd_ >= 0) ::close(fd_);
 #endif
         }
-        // Reset all members
+
+        // Step 2: close the underlying OS handle/fd unconditionally.
+        // This is the fix for the zero-byte file descriptor leak: previously
+        // this block lived inside the data_ guard above, so an empty file
+        // that set fd_ but left data_ null would never reach ::close(fd_).
+#ifdef _WIN32
+        if (hMapping_ != NULL) {
+            CloseHandle(hMapping_);
+            hMapping_ = NULL;
+        }
+        if (hFile_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(hFile_);
+            hFile_ = INVALID_HANDLE_VALUE;
+        }
+#else
+        if (fd_ >= 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+#endif
+
+        // Step 3: reset remaining members.
         data_ = nullptr;
         size_ = 0;
-#ifdef _WIN32
-        hMapping_ = NULL;
-        hFile_ = INVALID_HANDLE_VALUE;
-#else
-        fd_ = -1;
-#endif
     }
 
     // Accessor methods
