@@ -264,6 +264,21 @@ static std::atomic<bool> g_shutdownRequested{false};
  */
 static std::atomic<size_t> g_filesInProgress{0};
 
+/**
+ * g_tempFileCounter - Monotonically increasing counter for temp file names
+ *
+ * Used by atomic-write code paths to generate a unique suffix for every
+ * in-flight temp file.  A plain nanosecond timestamp is NOT sufficient:
+ * on Windows, steady_clock often has only 100 ns resolution, so multiple
+ * threads sampling it simultaneously get identical values and produce
+ * colliding ".tmp.<ns>" names, silently overwriting each other's data.
+ *
+ * An atomic fetch_add guarantees a distinct value per call across all
+ * threads with no locking overhead.  The counter never resets within a
+ * process lifetime, so even a retry of the same file gets a fresh suffix.
+ */
+static std::atomic<uint64_t> g_tempFileCounter{0};
+
 // ============================================================================
 // CONFIGURATION STRUCTURE
 // ============================================================================
@@ -1267,13 +1282,16 @@ private:
                 return false;
             }
 
-            // Determine destination path (temp file for atomic writes)
+            // Determine destination path (temp file for atomic writes).
+            // Use a global monotonic counter — NOT a timestamp — to guarantee
+            // a unique suffix across all concurrent threads.  Nanosecond
+            // timestamps are unsafe: on Windows, steady_clock resolution is
+            // often 100 ns, so simultaneous threads sample the same value and
+            // produce colliding ".tmp.<n>" names that corrupt each other's data.
             fs::path tempDest = info.dest;
             if (config.atomicWrites) {
-                // Generate unique temp filename using timestamp + random
-                auto now = steady_clock::now().time_since_epoch();
-                auto ns = duration_cast<nanoseconds>(now).count();
-                tempDest = info.dest.string() + ".tmp." + std::to_string(ns);
+                tempDest = info.dest.string() + ".tmp." +
+                           std::to_string(g_tempFileCounter.fetch_add(1, std::memory_order_relaxed));
             }
 
             // Open destination file for writing
@@ -1427,12 +1445,13 @@ public:
                 return false;
             }
 
-            // Determine destination path (with temp file support)
+            // Determine destination path (with temp file support).
+            // Same counter used by BufferedCopyStrategy — see that comment
+            // for why a timestamp is insufficient under parallelism.
             fs::path tempDest = info.dest;
             if (config.atomicWrites) {
-                auto now = steady_clock::now().time_since_epoch();
-                auto ns = duration_cast<nanoseconds>(now).count();
-                tempDest = info.dest.string() + ".tmp." + std::to_string(ns);
+                tempDest = info.dest.string() + ".tmp." +
+                           std::to_string(g_tempFileCounter.fetch_add(1, std::memory_order_relaxed));
             }
 
             // Open destination via memory mapping
