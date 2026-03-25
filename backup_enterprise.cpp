@@ -1308,21 +1308,78 @@ private:
             size_t totalRead = 0;
             auto startTime = steady_clock::now();
 
-            // Copy loop: read from source, write to destination
+            // Copy loop: read from source, write to destination.
+            // Track write failures separately so we can distinguish them
+            // from a clean shutdown interruption in the cleanup block below.
+            bool writeError = false;
             while (src.good() && !g_shutdownRequested.load()) {
                 src.read(buffer.data(), buffer.size());
                 std::streamsize bytesRead = src.gcount();
 
                 if (bytesRead > 0) {
                     dst.write(buffer.data(), bytesRead);
+
+                    // BUG FIX: check every write — a full disk or I/O error
+                    // sets the stream's failbit but does NOT throw by default,
+                    // so without this check the loop silently continued and
+                    // produced a truncated file with no error reported.
+                    if (!dst) {
+                        LOG_ERROR("Write error (disk full?) for: " + tempDest.string());
+                        writeError = true;
+                        break;
+                    }
+
                     totalRead += bytesRead;
                 }
             }
 
-            // Close destination to ensure data is flushed to disk
+            // Close before any cleanup or rename so the OS flushes buffers.
+            // We close even on failure paths — the file will be removed next.
             dst.close();
 
-            // Atomic rename: temp file -> final destination
+            // BUG FIX: guard the rename behind a full-success check.
+            //
+            // Previously the code fell straight through to fs::rename() even
+            // when the loop exited early — due to a write error, a read error,
+            // or a mid-copy shutdown signal — committing a truncated or
+            // zero-padded file as the final destination.
+            //
+            // Now we check every failure mode and discard the temp file so
+            // a subsequent run starts with a clean slate.
+            //
+            // Note: when atomicWrites is false, tempDest == info.dest, so
+            // fs::remove(tempDest) correctly removes the partial destination.
+            if (writeError) {
+                std::error_code ec;
+                fs::remove(tempDest, ec);
+                stats.errors++;
+                Metrics::instance().recordError();
+                return false;
+            }
+
+            if (src.bad()) {
+                // src.bad() = hardware/OS read error, distinct from clean EOF.
+                // src.fail() after a normal EOF read is expected and not an error.
+                LOG_ERROR("Read error on source: " + info.source.string());
+                std::error_code ec;
+                fs::remove(tempDest, ec);
+                stats.errors++;
+                Metrics::instance().recordError();
+                return false;
+            }
+
+            if (g_shutdownRequested.load()) {
+                // Loop exited cleanly but before EOF — file is incomplete.
+                // Discard the partial temp file and let the caller decide
+                // whether to retry (it won't: the retry loop also checks the
+                // shutdown flag before each attempt).
+                LOG_INFO("Shutdown mid-copy, discarding partial: " + tempDest.string());
+                std::error_code ec;
+                fs::remove(tempDest, ec);
+                return false;
+            }
+
+            // All bytes transferred successfully — safe to commit.
             if (config.atomicWrites) {
                 fs::rename(tempDest, info.dest);
             }
